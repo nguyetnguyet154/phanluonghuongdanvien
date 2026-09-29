@@ -442,7 +442,7 @@ with st.sidebar:
         menu_items = [
             "📊 Tổng quan", "👥 Quản lý tài khoản", "👤 Danh sách HDV",
             "🚌 Quản lý tour", "🧭 Phân công HDV", "📅 Xem lịch",
-            "📈 Báo cáo", "📋 Lịch sử điều hành"
+            "📈 Báo cáo", "📋 Lịch sử điều hành", "🗑️ Xóa dữ liệu"
         ]
     elif role == "Điều hành":
         menu_items = [
@@ -477,44 +477,75 @@ st.markdown("""
 # ============================================================
 # LOGIC GỢI Ý HDV
 # ============================================================
+def _normalize_route(value):
+    """Chuẩn hóa tên tuyến để không bị lỗi vì khoảng trắng/dấu gạch nối."""
+    import re
+    value = str(value or "").strip().lower()
+    value = value.replace("–", "-").replace("—", "-")
+    value = re.sub(r"\s*-\s*", " ", value)
+    value = re.sub(r"\s*[/,;]+\s*", " ", value)
+    value = re.sub(r"\s+", " ", value)
+    return value.strip()
+
+def _language_match(tour_language, guide_languages):
+    """So khớp ngoại ngữ linh hoạt."""
+    language = str(tour_language or "").strip().lower()
+    guide_language = str(guide_languages or "").strip().lower()
+
+    if not language or language == "tiếng việt":
+        return True
+    if language in guide_language:
+        return True
+
+    keyword_map = {
+        "tiếng anh": "anh",
+        "tiếng hàn": "hàn",
+        "tiếng trung": "trung",
+        "tiếng nhật": "nhật",
+    }
+    keyword = keyword_map.get(language)
+    return bool(keyword and keyword in guide_language)
+
+def _route_match(tour_destination, guide_route):
+    """So khớp tuyến, bỏ qua khác biệt khoảng trắng quanh dấu '-'."""
+    destination = _normalize_route(tour_destination)
+    route = _normalize_route(guide_route)
+    if not destination or not route:
+        return False
+    if destination in route or route in destination:
+        return True
+
+    # Tuyến có nhiều địa danh: chỉ cần có địa danh chính trùng là có thể gợi ý.
+    destination_parts = [p for p in destination.split() if len(p) >= 3]
+    route_parts = [p for p in route.split() if len(p) >= 3]
+    return bool(set(destination_parts) & set(route_parts))
+
 def guide_is_suitable(guide_row, tour_row):
     if str(guide_row["Trạng thái"]).strip().lower() != "sẵn sàng":
         return False
-
-    destination = str(tour_row["Điểm đến"]).lower()
-    route = str(guide_row["Chuyên tuyến"]).lower()
-    language = str(tour_row["Ngoại ngữ khách"]).lower()
-    guide_language = str(guide_row["Ngoại ngữ"]).lower()
-
-    language_ok = (
-        language in ["", "tiếng việt"]
-        or language in guide_language
-        or ("anh" in guide_language and "anh" in language)
-        or ("hàn" in guide_language and "hàn" in language)
-        or ("trung" in guide_language and "trung" in language)
+    return (
+        _language_match(tour_row["Ngoại ngữ khách"], guide_row["Ngoại ngữ"])
+        and _route_match(tour_row["Điểm đến"], guide_row["Chuyên tuyến"])
     )
-
-    route_ok = (
-        destination in route
-        or route in destination
-        or "đông nam bộ" in route
-        or ("vũng tàu" in route and "vũng tàu" in destination)
-    )
-
-    return language_ok and route_ok
 
 def recommend_guides(tour_row):
+    """Xếp hạng HDV sẵn sàng theo tuyến + ngoại ngữ + kinh nghiệm."""
     candidates = []
     for _, g in guides.iterrows():
-        if guide_is_suitable(g, tour_row):
-            score = 0
-            if str(tour_row["Ngoại ngữ khách"]).lower() in str(g["Ngoại ngữ"]).lower():
-                score += 50
-            if str(tour_row["Điểm đến"]).lower() in str(g["Chuyên tuyến"]).lower():
-                score += 30
-            score += min(int(g["Kinh nghiệm (năm)"]) * 2, 20)
+        if str(g["Trạng thái"]).strip().lower() != "sẵn sàng":
+            continue
+
+        route_ok = _route_match(tour_row["Điểm đến"], g["Chuyên tuyến"])
+        language_ok = _language_match(tour_row["Ngoại ngữ khách"], g["Ngoại ngữ"])
+        score = (60 if route_ok else 0) + (30 if language_ok else 0)
+        score += min(int(g["Kinh nghiệm (năm)"]) * 2, 20)
+
+        # Vẫn đưa HDV vào danh sách nếu khớp ít nhất một tiêu chí,
+        # thay vì làm màn hình phân công bị trống hoàn toàn.
+        if route_ok or language_ok:
             candidates.append((score, g))
-    candidates.sort(key=lambda x: x[0], reverse=True)
+
+    candidates.sort(key=lambda x: (-x[0], str(x[1]["Họ tên"])))
     return [x[1] for x in candidates]
 
 # ============================================================
@@ -1086,17 +1117,88 @@ elif menu == "🧭 Phân công HDV":
                     st.code(str(e))
         else:
             st.warning(
-                "⚠️ Chưa tìm thấy HDV đang sẵn sàng phù hợp cả tuyến và ngoại ngữ."
+                "⚠️ Chưa có HDV được gợi ý theo tuyến/ngoại ngữ. Bạn vẫn có thể chọn HDV đang sẵn sàng bên dưới."
             )
-            available = guides[guides["Trạng thái"] == "Sẵn sàng"]
+            available = guides[
+                guides["Trạng thái"].astype(str).str.strip().str.lower() == "sẵn sàng"
+            ].copy()
+
             if not available.empty:
-                st.dataframe(
-                    available[
-                        ["Mã HDV","Họ tên","Ngoại ngữ","Chuyên tuyến","Kinh nghiệm (năm)"]
-                    ],
-                    use_container_width=True,
-                    hide_index=True,
+                available_options = [
+                    f'{g["Mã HDV"]} | {g["Họ tên"]} | {g["Ngoại ngữ"]}'
+                    for _, g in available.iterrows()
+                ]
+                manual_selected = st.selectbox(
+                    "Chọn HDV đang sẵn sàng",
+                    available_options,
+                    key=f"manual_guide_{tour_code}"
                 )
+                manual_code = manual_selected.split(" | ")[0]
+
+                if st.button(
+                    "✅ XÁC NHẬN PHÂN CÔNG",
+                    type="primary",
+                    use_container_width=True,
+                    key=f"manual_assign_{tour_code}"
+                ):
+                    try:
+                        with get_engine().begin() as conn:
+                            guide = conn.execute(
+                                text("""
+                                SELECT guide_code, full_name, status
+                                FROM guides
+                                WHERE guide_code = :code
+                                FOR UPDATE
+                                """),
+                                {"code": manual_code},
+                            ).mappings().first()
+
+                            if not guide or str(guide["status"]).strip().lower() != "sẵn sàng":
+                                st.error("HDV này không còn ở trạng thái Sẵn sàng.")
+                                st.stop()
+
+                            conn.execute(
+                                text("""
+                                UPDATE tours
+                                SET guide_code=:guide_code, status='Đã phân công'
+                                WHERE tour_code=:tour_code
+                                """),
+                                {"guide_code": manual_code, "tour_code": tour_code},
+                            )
+                            conn.execute(
+                                text("UPDATE guides SET status='Bận' WHERE guide_code=:guide_code"),
+                                {"guide_code": manual_code},
+                            )
+                            conn.execute(
+                                text("""
+                                INSERT INTO assignments(tour_code, guide_code, assigned_by, status)
+                                VALUES(:tour_code, :guide_code, :assigned_by, 'Đang phân công')
+                                """),
+                                {
+                                    "tour_code": tour_code,
+                                    "guide_code": manual_code,
+                                    "assigned_by": current_user["full_name"],
+                                },
+                            )
+                            conn.execute(
+                                text("""
+                                INSERT INTO logs(action, tour_code, content, created_by)
+                                VALUES('Phân công HDV', :tour_code, :content, :created_by)
+                                """),
+                                {
+                                    "tour_code": tour_code,
+                                    "content": f'Phân công {guide["full_name"]} ({manual_code})',
+                                    "created_by": current_user["full_name"],
+                                },
+                            )
+
+                        st.success(f'Đã phân công {guide["full_name"]} cho {tour_code}.')
+                        st.rerun()
+                    except SQLAlchemyError as e:
+                        st.error("Không thể lưu phân công.")
+                        st.code(str(e))
+            else:
+                st.error("Hiện không có HDV nào ở trạng thái Sẵn sàng.")
 
 # ============================================================
 # QUẢN LÝ TOUR
@@ -1275,6 +1377,228 @@ elif menu == "🚌 Quản lý tour":
                 st.rerun()
             except SQLAlchemyError as e:
                 st.error("Không thể cập nhật.")
+                st.code(str(e))
+
+# ============================================================
+# XÓA DỮ LIỆU - ADMIN
+# ============================================================
+elif menu == "🗑️ Xóa dữ liệu":
+    if role != "Admin":
+        st.error("Chỉ Quản trị viên mới được xóa dữ liệu.")
+        st.stop()
+
+    st.markdown('<div class="section-title">🗑️ Xóa dữ liệu đã lưu trên MySQL</div>', unsafe_allow_html=True)
+    st.warning(
+        "⚠️ Thao tác xóa sẽ xóa trực tiếp dữ liệu trên Aiven MySQL. "
+        "Hãy kiểm tra kỹ mã trước khi xác nhận."
+    )
+
+    tab_tour, tab_guide, tab_log = st.tabs(["🚌 Xóa tour", "👤 Xóa HDV", "📋 Xóa lịch sử"])
+
+    with tab_tour:
+        delete_tours = query_df("""
+            SELECT
+                t.tour_code AS `Mã tour`,
+                t.tour_name AS `Tên tour`,
+                DATE_FORMAT(t.travel_date, '%d/%m/%Y') AS `Ngày đi`,
+                t.destination AS `Điểm đến`,
+                COALESCE(g.full_name, '') AS `HDV`,
+                t.status AS `Trạng thái`
+            FROM tours t
+            LEFT JOIN guides g ON g.guide_code = t.guide_code
+            ORDER BY t.travel_date DESC, t.tour_code DESC
+        """)
+
+        if delete_tours.empty:
+            st.info("Hiện chưa có tour nào để xóa.")
+        else:
+            st.dataframe(delete_tours, use_container_width=True, hide_index=True)
+            delete_tour_code = st.selectbox(
+                "Chọn tour muốn xóa",
+                delete_tours["Mã tour"].tolist(),
+                key="delete_tour_code"
+            )
+
+            selected_tour = delete_tours[delete_tours["Mã tour"] == delete_tour_code].iloc[0]
+            st.error(
+                f"Bạn đang chọn: **{selected_tour['Mã tour']} - {selected_tour['Tên tour']}** "
+                f"({selected_tour['Ngày đi']})."
+            )
+
+            confirm_tour = st.checkbox(
+                "Tôi chắc chắn muốn xóa tour này khỏi MySQL.",
+                key="confirm_delete_tour"
+            )
+
+            if st.button(
+                "🗑️ XÓA TOUR VĨNH VIỄN",
+                type="primary",
+                disabled=not confirm_tour,
+                use_container_width=True,
+                key="delete_tour_button"
+            ):
+                try:
+                    with get_engine().begin() as conn:
+                        current = conn.execute(
+                            text("""
+                            SELECT tour_code, tour_name, guide_code, status
+                            FROM tours
+                            WHERE tour_code=:tour_code
+                            FOR UPDATE
+                            """),
+                            {"tour_code": delete_tour_code}
+                        ).mappings().first()
+
+                        if not current:
+                            st.error("Tour không còn tồn tại trong MySQL.")
+                            st.stop()
+
+                        guide_code = current["guide_code"] or ""
+
+                        # Xóa dữ liệu liên quan trước.
+                        conn.execute(
+                            text("DELETE FROM assignments WHERE tour_code=:tour_code"),
+                            {"tour_code": delete_tour_code}
+                        )
+                        conn.execute(
+                            text("DELETE FROM logs WHERE tour_code=:tour_code"),
+                            {"tour_code": delete_tour_code}
+                        )
+                        conn.execute(
+                            text("DELETE FROM tours WHERE tour_code=:tour_code"),
+                            {"tour_code": delete_tour_code}
+                        )
+
+                        # Nếu HDV của tour này không còn tour đang thực hiện/chưa hoàn thành
+                        # thì trả trạng thái về Sẵn sàng.
+                        if guide_code:
+                            active_count = conn.execute(
+                                text("""
+                                SELECT COUNT(*)
+                                FROM tours
+                                WHERE guide_code=:guide_code
+                                  AND status NOT IN ('Hoàn thành','Đã hủy')
+                                """),
+                                {"guide_code": guide_code}
+                            ).scalar()
+
+                            if int(active_count or 0) == 0:
+                                conn.execute(
+                                    text("UPDATE guides SET status='Sẵn sàng' WHERE guide_code=:guide_code"),
+                                    {"guide_code": guide_code}
+                                )
+
+                        conn.execute(
+                            text("""
+                            INSERT INTO logs(action, tour_code, content, created_by)
+                            VALUES('Xóa tour', '', :content, :created_by)
+                            """),
+                            {
+                                "content": f"Đã xóa tour {delete_tour_code} - {current['tour_name']}",
+                                "created_by": current_user["full_name"],
+                            }
+                        )
+
+                    st.success(f"Đã xóa tour {delete_tour_code} khỏi MySQL.")
+                    st.rerun()
+                except SQLAlchemyError as e:
+                    st.error("Không thể xóa tour. Không có dữ liệu nào được xóa nếu giao dịch thất bại.")
+                    st.code(str(e))
+
+    with tab_guide:
+        delete_guides = query_df("""
+            SELECT guide_code AS `Mã HDV`, full_name AS `Họ tên`,
+                   languages AS `Ngoại ngữ`, routes AS `Chuyên tuyến`,
+                   status AS `Trạng thái`
+            FROM guides
+            ORDER BY id DESC
+        """)
+
+        if delete_guides.empty:
+            st.info("Hiện chưa có HDV nào để xóa.")
+        else:
+            st.dataframe(delete_guides, use_container_width=True, hide_index=True)
+            delete_guide_code = st.selectbox(
+                "Chọn HDV muốn xóa",
+                delete_guides["Mã HDV"].tolist(),
+                key="delete_guide_code"
+            )
+            selected_guide = delete_guides[delete_guides["Mã HDV"] == delete_guide_code].iloc[0]
+
+            active_tour_count = int(query_df(
+                "SELECT COUNT(*) AS n FROM tours WHERE guide_code=:guide_code AND status NOT IN ('Hoàn thành','Đã hủy')",
+                {"guide_code": delete_guide_code}
+            ).iloc[0]["n"])
+
+            linked_account_count = int(query_df(
+                "SELECT COUNT(*) AS n FROM accounts WHERE guide_code=:guide_code",
+                {"guide_code": delete_guide_code}
+            ).iloc[0]["n"])
+
+            if active_tour_count > 0:
+                st.error(f"Không thể xóa HDV này vì đang có {active_tour_count} tour chưa hoàn thành.")
+            else:
+                if linked_account_count > 0:
+                    st.info("Tài khoản HDV liên kết sẽ được bỏ liên kết trước khi xóa HDV.")
+                confirm_guide = st.checkbox(
+                    f"Tôi chắc chắn muốn xóa HDV {selected_guide['Họ tên']} ({delete_guide_code}).",
+                    key="confirm_delete_guide"
+                )
+
+                if st.button(
+                    "🗑️ XÓA HDV VĨNH VIỄN",
+                    type="primary",
+                    disabled=not confirm_guide,
+                    use_container_width=True,
+                    key="delete_guide_button"
+                ):
+                    try:
+                        with get_engine().begin() as conn:
+                            # Không để tài khoản HDV giữ mã HDV đã bị xóa.
+                            conn.execute(
+                                text("UPDATE accounts SET guide_code=NULL WHERE guide_code=:guide_code"),
+                                {"guide_code": delete_guide_code}
+                            )
+                            conn.execute(
+                                text("DELETE FROM guides WHERE guide_code=:guide_code"),
+                                {"guide_code": delete_guide_code}
+                            )
+                            conn.execute(
+                                text("""
+                                INSERT INTO logs(action, tour_code, content, created_by)
+                                VALUES('Xóa HDV', '', :content, :created_by)
+                                """),
+                                {
+                                    "content": f"Đã xóa HDV {selected_guide['Họ tên']} ({delete_guide_code})",
+                                    "created_by": current_user["full_name"],
+                                }
+                            )
+                        st.success(f"Đã xóa HDV {delete_guide_code} khỏi MySQL.")
+                        st.rerun()
+                    except SQLAlchemyError as e:
+                        st.error("Không thể xóa HDV.")
+                        st.code(str(e))
+
+    with tab_log:
+        log_count = int(query_df("SELECT COUNT(*) AS n FROM logs").iloc[0]["n"])
+        st.metric("Số dòng lịch sử hiện có", log_count)
+        confirm_logs = st.checkbox(
+            "Tôi chắc chắn muốn xóa toàn bộ lịch sử điều hành.",
+            key="confirm_delete_logs"
+        )
+        if st.button(
+            "🗑️ XÓA TOÀN BỘ LỊCH SỬ",
+            type="secondary",
+            disabled=not confirm_logs,
+            use_container_width=True,
+            key="delete_logs_button"
+        ):
+            try:
+                execute_sql("DELETE FROM logs")
+                st.success("Đã xóa toàn bộ lịch sử điều hành khỏi MySQL.")
+                st.rerun()
+            except SQLAlchemyError as e:
+                st.error("Không thể xóa lịch sử.")
                 st.code(str(e))
 
 # ============================================================
