@@ -5,6 +5,8 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.exc import SQLAlchemyError
 from urllib.parse import quote_plus
 import uuid
+import hashlib
+import secrets
 
 # ============================================================
 # GUIDE FLOW - MYSQL / AIVEN VERSION
@@ -136,6 +138,20 @@ CREATE_TABLES_SQL = [
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
     """,
     """
+    CREATE TABLE IF NOT EXISTS accounts (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        username VARCHAR(80) NOT NULL UNIQUE,
+        password_hash VARCHAR(255) NOT NULL,
+        full_name VARCHAR(150) NOT NULL,
+        role VARCHAR(30) NOT NULL,
+        guide_code VARCHAR(30) DEFAULT NULL,
+        active TINYINT(1) DEFAULT 1,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_accounts_role (role),
+        INDEX idx_accounts_guide (guide_code)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    """,
+    """
     CREATE TABLE IF NOT EXISTS logs (
         id INT AUTO_INCREMENT PRIMARY KEY,
         action VARCHAR(100),
@@ -178,6 +194,55 @@ def add_log(action, tour_code="", content="", created_by="Điều hành"):
 
 def make_id(prefix):
     return prefix + uuid.uuid4().hex[:6].upper()
+
+def hash_password(password, salt=None):
+    salt = salt or secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 120_000).hex()
+    return f"pbkdf2_sha256$120000${salt}${digest}"
+
+def verify_password(password, stored):
+    try:
+        algorithm, iterations, salt, digest = stored.split("$", 3)
+        if algorithm != "pbkdf2_sha256":
+            return False
+        check = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), int(iterations)).hex()
+        return secrets.compare_digest(check, digest)
+    except Exception:
+        return False
+
+def seed_accounts():
+    count = int(query_df("SELECT COUNT(*) AS n FROM accounts").iloc[0]["n"])
+    if count > 0:
+        return
+    demo_accounts = [
+        ("admin", "admin123", "Quản trị viên", "Admin", None),
+        ("dieuhanh", "dieuhanh123", "Nhân viên Điều hành", "Điều hành", None),
+        ("hdv001", "123456", "Nguyễn Minh Anh", "HDV", "HDV001"),
+    ]
+    with get_engine().begin() as conn:
+        for username, password, full_name, role, guide_code in demo_accounts:
+            conn.execute(text("""
+                INSERT INTO accounts(username, password_hash, full_name, role, guide_code, active)
+                VALUES (:username, :password_hash, :full_name, :role, :guide_code, 1)
+            """), {
+                "username": username, "password_hash": hash_password(password),
+                "full_name": full_name, "role": role, "guide_code": guide_code
+            })
+
+def authenticate(username, password):
+    row = query_df(
+        "SELECT username, password_hash, full_name, role, guide_code, active FROM accounts WHERE username=:username LIMIT 1",
+        {"username": username.strip()}
+    )
+    if row.empty or int(row.iloc[0]["active"]) != 1:
+        return None
+    record = row.iloc[0]
+    if not verify_password(password, record["password_hash"]):
+        return None
+    return {
+        "username": record["username"], "full_name": record["full_name"],
+        "role": record["role"], "guide_code": record["guide_code"] or ""
+    }
 
 def seed_demo_data():
     guide_count = int(query_df("SELECT COUNT(*) AS n FROM guides").iloc[0]["n"])
@@ -245,6 +310,7 @@ def seed_demo_data():
 try:
     setup_database()
     seed_demo_data()
+    seed_accounts()
     DB_OK = True
     DB_ERROR = ""
 except Exception as e:
@@ -289,6 +355,39 @@ if not DB_OK:
         "App dùng SSL vì Aiven yêu cầu kết nối mã hóa."
     )
     st.stop()
+
+# ============================================================
+# ĐĂNG NHẬP & PHÂN QUYỀN
+# ============================================================
+if "current_user" not in st.session_state:
+    st.session_state.current_user = None
+
+if st.session_state.current_user is None:
+    st.markdown("""
+    <div class="hero">
+        <h1>🧭 GUIDE FLOW</h1>
+        <p>Hệ thống điều hành tour & phân luồng hướng dẫn viên nội bộ</p>
+    </div>
+    """, unsafe_allow_html=True)
+    left, center, right = st.columns([1, 1.4, 1])
+    with center:
+        st.markdown("### 🔐 Đăng nhập hệ thống")
+        with st.form("login_form"):
+            username = st.text_input("Tên đăng nhập", placeholder="Nhập tài khoản")
+            password = st.text_input("Mật khẩu", type="password", placeholder="Nhập mật khẩu")
+            submitted = st.form_submit_button("🚀 ĐĂNG NHẬP", type="primary", use_container_width=True)
+            if submitted:
+                user = authenticate(username, password)
+                if user:
+                    st.session_state.current_user = user
+                    st.rerun()
+                else:
+                    st.error("Sai tài khoản, mật khẩu hoặc tài khoản đã bị khóa.")
+        st.info("Tài khoản mẫu: admin / admin123 • dieuhanh / dieuhanh123 • hdv001 / 123456")
+    st.stop()
+
+current_user = st.session_state.current_user
+role = current_user["role"]
 
 # ============================================================
 # LOAD DATA
@@ -337,24 +436,33 @@ with st.sidebar:
     )
     st.markdown("### 🧭 GuideFlow")
     st.caption("Phân luồng hướng dẫn viên nội bộ")
+    st.success(f"👤 {current_user['full_name']}\n\n🔑 {role}")
 
-    if DB_OK:
-        st.success("🟢 Aiven MySQL: Đã kết nối")
+    if role == "Admin":
+        menu_items = [
+            "📊 Tổng quan", "👥 Quản lý tài khoản", "👤 Danh sách HDV",
+            "🚌 Quản lý tour", "🧭 Phân công HDV", "📅 Xem lịch",
+            "📈 Báo cáo", "📋 Lịch sử điều hành"
+        ]
+    elif role == "Điều hành":
+        menu_items = [
+            "📊 Tổng quan", "🚌 Tạo tour", "🔎 Tìm HDV",
+            "🧭 Phân công HDV", "📅 Xem lịch"
+        ]
+    else:
+        menu_items = [
+            "📊 Tổng quan", "🚌 Tour được giao", "📅 Lịch cá nhân",
+            "🔄 Cập nhật trạng thái"
+        ]
 
-    menu = st.radio(
-        "MENU",
-        [
-            "📊 Tổng quan",
-            "🧭 Phân công HDV",
-            "🚌 Quản lý tour",
-            "👤 Danh sách HDV",
-            "📋 Lịch sử điều hành",
-        ],
-    )
-
+    menu = st.radio("MENU", menu_items)
     st.divider()
+    if st.button("🚪 Đăng xuất", use_container_width=True):
+        st.session_state.current_user = None
+        st.rerun()
+    if DB_OK:
+        st.caption("🟢 Aiven MySQL: Đã kết nối")
     st.caption(f"Database: {DB['database']}")
-    st.caption("Dữ liệu được lưu trực tiếp trên Aiven MySQL.")
 
 # ============================================================
 # HEADER
@@ -408,6 +516,415 @@ def recommend_guides(tour_row):
             candidates.append((score, g))
     candidates.sort(key=lambda x: x[0], reverse=True)
     return [x[1] for x in candidates]
+
+# ============================================================
+# QUẢN LÝ TÀI KHOẢN - ADMIN
+# ============================================================
+if menu == "👥 Quản lý tài khoản":
+    st.markdown('<div class="section-title">👥 Quản lý tài khoản nhân viên</div>', unsafe_allow_html=True)
+    accounts = query_df("""
+        SELECT username AS `Tài khoản`, full_name AS `Họ tên`, role AS `Vai trò`,
+               COALESCE(guide_code, '') AS `Mã HDV`,
+               CASE WHEN active=1 THEN 'Đang hoạt động' ELSE 'Đã khóa' END AS `Trạng thái`,
+               DATE_FORMAT(created_at,'%d/%m/%Y %H:%i') AS `Ngày tạo`
+        FROM accounts ORDER BY id DESC
+    """)
+    st.dataframe(accounts, use_container_width=True, hide_index=True)
+    st.markdown("### ➕ Thêm tài khoản nhân viên")
+    with st.form("create_account"):
+        c1,c2=st.columns(2)
+        username=c1.text_input("Tên đăng nhập *")
+        full_name=c2.text_input("Họ tên *")
+        c3,c4,c5=st.columns(3)
+        new_password=c3.text_input("Mật khẩu *", type="password")
+        new_role=c4.selectbox("Vai trò", ["Admin","Điều hành","HDV"])
+        guide_code=c5.text_input("Mã HDV", placeholder="Chỉ nhập nếu vai trò là HDV")
+        create=st.form_submit_button("➕ TẠO TÀI KHOẢN", type="primary", use_container_width=True)
+        if create:
+            if not username.strip() or not full_name.strip() or not new_password:
+                st.error("Vui lòng nhập đầy đủ tài khoản, họ tên và mật khẩu.")
+            elif new_role=="HDV" and not guide_code.strip():
+                st.error("Tài khoản HDV phải liên kết với Mã HDV.")
+            else:
+                try:
+                    with get_engine().begin() as conn:
+                        if new_role=="HDV":
+                            exists=conn.execute(text("SELECT COUNT(*) FROM guides WHERE guide_code=:code"),{"code":guide_code.strip()}).scalar()
+                            if not exists:
+                                st.error("Mã HDV không tồn tại.")
+                                st.stop()
+                        conn.execute(text("""
+                            INSERT INTO accounts(username,password_hash,full_name,role,guide_code,active)
+                            VALUES(:username,:password_hash,:full_name,:role,:guide_code,1)
+                        """),{"username":username.strip(),"password_hash":hash_password(new_password),"full_name":full_name.strip(),"role":new_role,"guide_code":guide_code.strip() if new_role=="HDV" else None})
+                    st.success("Đã tạo tài khoản.")
+                    st.rerun()
+                except SQLAlchemyError as e:
+                    st.error("Không thể tạo tài khoản. Có thể tên đăng nhập đã tồn tại.")
+                    st.code(str(e))
+    st.markdown("### 🔒 Khóa / mở khóa tài khoản")
+    if not accounts.empty:
+        selected_user=st.selectbox("Chọn tài khoản",accounts["Tài khoản"].tolist())
+        new_active=st.selectbox("Trạng thái mới",["Đang hoạt động","Đã khóa"])
+        if st.button("💾 CẬP NHẬT TÀI KHOẢN",use_container_width=True):
+            if selected_user==current_user["username"] and new_active=="Đã khóa":
+                st.error("Không thể tự khóa tài khoản đang đăng nhập.")
+            else:
+                execute_sql("UPDATE accounts SET active=:active WHERE username=:username",{"active":1 if new_active=="Đang hoạt động" else 0,"username":selected_user})
+                st.success("Đã cập nhật tài khoản.")
+                st.rerun()
+
+# ============================================================
+# TÌM HDV - ĐIỀU HÀNH
+# ============================================================
+elif menu == "🔎 Tìm HDV":
+    st.markdown('<div class="section-title">🔎 Tìm hướng dẫn viên</div>', unsafe_allow_html=True)
+    c1,c2,c3=st.columns(3)
+    keyword=c1.text_input("Từ khóa",placeholder="Tên / mã HDV")
+    status_filter=c2.selectbox("Trạng thái",["Tất cả","Sẵn sàng","Bận","Nghỉ phép"])
+    language_filter=c3.text_input("Ngoại ngữ",placeholder="Ví dụ: Tiếng Hàn")
+    q="SELECT guide_code AS `Mã HDV`,full_name AS `Họ tên`,phone AS `SĐT`,languages AS `Ngoại ngữ`,routes AS `Chuyên tuyến`,experience_years AS `Kinh nghiệm (năm)`,status AS `Trạng thái`,note AS `Ghi chú` FROM guides WHERE 1=1"
+    params={}
+    if keyword.strip(): q+=" AND (full_name LIKE :kw OR guide_code LIKE :kw)"; params["kw"]=f"%{keyword.strip()}%"
+    if status_filter!="Tất cả": q+=" AND status=:status"; params["status"]=status_filter
+    if language_filter.strip(): q+=" AND languages LIKE :lang"; params["lang"]=f"%{language_filter.strip()}%"
+    q+=" ORDER BY status,experience_years DESC"
+    st.dataframe(query_df(q,params),use_container_width=True,hide_index=True)
+
+# ============================================================
+# XEM LỊCH
+# ============================================================
+elif menu == "📅 Xem lịch":
+    st.markdown('<div class="section-title">📅 Lịch tour</div>',unsafe_allow_html=True)
+    c1,c2=st.columns(2)
+    start_date=c1.date_input("Từ ngày",value=date.today())
+    end_date=c2.date_input("Đến ngày",value=date.today())
+    if start_date>end_date: st.error("Khoảng ngày không hợp lệ.")
+    else:
+        calendar=query_df("""
+            SELECT t.tour_code AS `Mã tour`,t.tour_name AS `Tour`,DATE_FORMAT(t.travel_date,'%d/%m/%Y') AS `Ngày đi`,TIME_FORMAT(t.meeting_time,'%H:%i') AS `Giờ`,t.destination AS `Điểm đến`,t.guest_count AS `Số khách`,COALESCE(g.full_name,'Chưa phân công') AS `HDV`,t.status AS `Trạng thái`
+            FROM tours t LEFT JOIN guides g ON g.guide_code=t.guide_code
+            WHERE t.travel_date BETWEEN :start_date AND :end_date
+            ORDER BY t.travel_date,t.meeting_time
+        """,{"start_date":start_date,"end_date":end_date})
+        st.dataframe(calendar,use_container_width=True,hide_index=True)
+
+# ============================================================
+# BÁO CÁO - ADMIN
+# ============================================================
+elif menu == "📈 Báo cáo":
+    st.markdown('<div class="section-title">📈 Báo cáo & phân tích nguồn lực HDV</div>', unsafe_allow_html=True)
+    st.caption("Theo dõi hiệu suất HDV, số tour theo tháng, tuyến phổ biến, nhu cầu HDV và tình trạng thiếu/quá tải.")
+
+    # Bộ lọc thời gian và ngưỡng quá tải
+    c1, c2, c3 = st.columns(3)
+    report_month = c1.date_input("Tháng báo cáo", value=date.today())
+    overload_limit = c2.number_input(
+        "Ngưỡng quá tải (tour/HDV/tháng)",
+        min_value=1,
+        max_value=31,
+        value=6,
+        step=1,
+        help="HDV có số tour được giao trong tháng bằng hoặc vượt ngưỡng này sẽ được đưa vào nhóm lịch dày/quá tải."
+    )
+
+    month_start = report_month.replace(day=1)
+    if report_month.month == 12:
+        next_month = date(report_month.year + 1, 1, 1)
+    else:
+        next_month = date(report_month.year, report_month.month + 1, 1)
+
+    month_label = report_month.strftime("%m/%Y")
+
+    # ------------------------------------------------------------
+    # 1. HIỆU SUẤT HDV
+    # ------------------------------------------------------------
+    st.markdown("### 👤 Hiệu suất HDV")
+
+    performance = query_df("""
+        SELECT
+            g.guide_code AS `Mã HDV`,
+            g.full_name AS `HDV`,
+            g.status AS `Trạng thái hiện tại`,
+            COUNT(CASE
+                WHEN t.travel_date >= :month_start
+                 AND t.travel_date < :next_month
+                 AND t.guide_code = g.guide_code
+                THEN 1 END) AS `Số tour/tháng`,
+            COUNT(CASE
+                WHEN t.travel_date >= :month_start
+                 AND t.travel_date < :next_month
+                 AND t.guide_code = g.guide_code
+                 AND t.status = 'Hoàn thành'
+                THEN 1 END) AS `Tour hoàn thành`,
+            COALESCE(SUM(CASE
+                WHEN t.travel_date >= :month_start
+                 AND t.travel_date < :next_month
+                 AND t.guide_code = g.guide_code
+                THEN t.guest_count ELSE 0 END), 0) AS `Số khách phục vụ`
+        FROM guides g
+        LEFT JOIN tours t ON t.guide_code = g.guide_code
+        GROUP BY g.guide_code, g.full_name, g.status
+        ORDER BY `Số tour/tháng` DESC, `Tour hoàn thành` DESC, g.full_name
+    """, {"month_start": month_start, "next_month": next_month})
+
+    if not performance.empty:
+        performance["Tỷ lệ hoàn thành"] = performance.apply(
+            lambda r: round((r["Tour hoàn thành"] / r["Số tour/tháng"] * 100), 1)
+            if r["Số tour/tháng"] else 0.0,
+            axis=1
+        )
+
+        st.dataframe(
+            performance[
+                ["Mã HDV", "HDV", "Trạng thái hiện tại", "Số tour/tháng",
+                 "Tour hoàn thành", "Tỷ lệ hoàn thành", "Số khách phục vụ"]
+            ],
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Tỷ lệ hoàn thành": st.column_config.ProgressColumn(
+                    "Tỷ lệ hoàn thành", min_value=0, max_value=100, format="%.1f%%"
+                )
+            }
+        )
+    else:
+        st.info("Chưa có dữ liệu HDV.")
+
+    # ------------------------------------------------------------
+    # 2. SỐ TOUR / THÁNG
+    # ------------------------------------------------------------
+    st.markdown("### 📅 Số tour/tháng")
+
+    monthly = query_df("""
+        SELECT
+            DATE_FORMAT(travel_date, '%Y-%m') AS `Tháng`,
+            COUNT(*) AS `Tổng tour`,
+            SUM(CASE WHEN guide_code IS NULL OR guide_code = '' THEN 1 ELSE 0 END) AS `Tour chưa có HDV`,
+            SUM(CASE WHEN status = 'Hoàn thành' THEN 1 ELSE 0 END) AS `Tour hoàn thành`,
+            COALESCE(SUM(guest_count), 0) AS `Tổng khách`
+        FROM tours
+        WHERE travel_date >= DATE_SUB(:month_start, INTERVAL 11 MONTH)
+          AND travel_date < :next_month
+        GROUP BY DATE_FORMAT(travel_date, '%Y-%m')
+        ORDER BY `Tháng`
+    """, {"month_start": month_start, "next_month": next_month})
+
+    if not monthly.empty:
+        chart_monthly = monthly.set_index("Tháng")[["Tổng tour", "Tour chưa có HDV", "Tour hoàn thành"]]
+        st.line_chart(chart_monthly, use_container_width=True)
+        st.dataframe(monthly, use_container_width=True, hide_index=True)
+    else:
+        st.info("Chưa có dữ liệu tour trong khoảng thời gian báo cáo.")
+
+    # ------------------------------------------------------------
+    # 3. TUYẾN / ĐIỂM ĐẾN PHỔ BIẾN
+    # ------------------------------------------------------------
+    st.markdown("### 🗺️ Tuyến phổ biến")
+
+    popular_routes = query_df("""
+        SELECT
+            destination AS `Điểm đến`,
+            COUNT(*) AS `Số tour`,
+            COALESCE(SUM(guest_count), 0) AS `Số khách`
+        FROM tours
+        WHERE travel_date >= :month_start
+          AND travel_date < :next_month
+        GROUP BY destination
+        ORDER BY `Số tour` DESC, `Số khách` DESC
+    """, {"month_start": month_start, "next_month": next_month})
+
+    if not popular_routes.empty:
+        c1, c2 = st.columns([1.15, 1])
+        with c1:
+            st.dataframe(popular_routes, use_container_width=True, hide_index=True)
+        with c2:
+            st.bar_chart(popular_routes.set_index("Điểm đến")["Số tour"], use_container_width=True)
+    else:
+        st.info(f"Chưa có tour trong tháng {month_label}.")
+
+    # ------------------------------------------------------------
+    # 4. NHU CẦU HDV
+    # ------------------------------------------------------------
+    st.markdown("### 👥 Nhu cầu HDV")
+
+    demand = query_df("""
+        SELECT
+            COUNT(*) AS total_tours,
+            SUM(CASE WHEN guide_code IS NULL OR guide_code = '' THEN 1 ELSE 0 END) AS unassigned_tours,
+            SUM(CASE WHEN guide_code IS NOT NULL AND guide_code <> '' THEN 1 ELSE 0 END) AS assigned_tours,
+            COALESCE(SUM(guest_count), 0) AS total_guests
+        FROM tours
+        WHERE travel_date >= :month_start
+          AND travel_date < :next_month
+          AND status <> 'Đã hủy'
+    """, {"month_start": month_start, "next_month": next_month})
+
+    available_guides = int(query_df("""
+        SELECT COUNT(*) AS n
+        FROM guides
+        WHERE status = 'Sẵn sàng'
+    """).iloc[0]["n"])
+
+    total_guides = int(query_df("SELECT COUNT(*) AS n FROM guides").iloc[0]["n"])
+    unassigned_tours = int(demand.iloc[0]["unassigned_tours"] or 0)
+    assigned_tours = int(demand.iloc[0]["assigned_tours"] or 0)
+    total_tours_month = int(demand.iloc[0]["total_tours"] or 0)
+    total_guests_month = int(demand.iloc[0]["total_guests"] or 0)
+
+    d1, d2, d3, d4 = st.columns(4)
+    d1.metric("🚌 Tổng tour", total_tours_month)
+    d2.metric("⏳ Tour cần HDV", unassigned_tours)
+    d3.metric("👤 HDV sẵn sàng", available_guides)
+    d4.metric("👥 Tổng HDV", total_guides)
+
+    if unassigned_tours > available_guides:
+        st.error(
+            f"🔴 Nhu cầu đang cao: còn {unassigned_tours} tour chưa có HDV, "
+            f"trong khi hiện có {available_guides} HDV đang sẵn sàng."
+        )
+    elif unassigned_tours > 0:
+        st.warning(
+            f"🟡 Có {unassigned_tours} tour chưa được phân công HDV. "
+            f"Hiện có {available_guides} HDV đang sẵn sàng."
+        )
+    else:
+        st.success("🟢 Các tour trong tháng hiện đã có HDV hoặc không còn tour chờ phân công.")
+
+    # ------------------------------------------------------------
+    # 5. HDV ĐANG THIẾU / QUÁ TẢI
+    # ------------------------------------------------------------
+    st.markdown("### 🚦 HDV đang thiếu / quá tải")
+
+    workload = query_df("""
+        SELECT
+            g.guide_code AS `Mã HDV`,
+            g.full_name AS `HDV`,
+            g.status AS `Trạng thái`,
+            COUNT(CASE
+                WHEN t.travel_date >= :month_start
+                 AND t.travel_date < :next_month
+                 AND t.status <> 'Đã hủy'
+                THEN t.tour_code END) AS `Số tour được giao`,
+            COALESCE(SUM(CASE
+                WHEN t.travel_date >= :month_start
+                 AND t.travel_date < :next_month
+                 AND t.status <> 'Đã hủy'
+                THEN t.guest_count ELSE 0 END), 0) AS `Số khách`
+        FROM guides g
+        LEFT JOIN tours t ON t.guide_code = g.guide_code
+        GROUP BY g.guide_code, g.full_name, g.status
+        ORDER BY `Số tour được giao` DESC, g.full_name
+    """, {"month_start": month_start, "next_month": next_month})
+
+    if not workload.empty:
+        workload["Phân loại"] = workload["Số tour được giao"].apply(
+            lambda x: "🔴 Quá tải" if x >= overload_limit else ("🟢 Bình thường" if x > 0 else "⚪ Chưa có tour")
+        )
+
+        overloaded = workload[workload["Số tour được giao"] >= overload_limit].copy()
+        no_tour = workload[workload["Số tour được giao"] == 0].copy()
+
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown(f"**🔴 HDV lịch dày từ {overload_limit} tour/tháng**")
+            if overloaded.empty:
+                st.success("Không có HDV vượt ngưỡng trong tháng này.")
+            else:
+                st.dataframe(
+                    overloaded[["Mã HDV", "HDV", "Trạng thái", "Số tour được giao", "Số khách", "Phân loại"]],
+                    use_container_width=True,
+                    hide_index=True
+                )
+
+        with c2:
+            st.markdown("**🟢 HDV chưa được giao tour trong tháng**")
+            if no_tour.empty:
+                st.info("Không có dữ liệu.")
+            else:
+                st.dataframe(
+                    no_tour[["Mã HDV", "HDV", "Trạng thái", "Số tour được giao", "Số khách", "Phân loại"]],
+                    use_container_width=True,
+                    hide_index=True
+                )
+
+        st.markdown("**📊 Phân bổ khối lượng HDV**")
+        st.bar_chart(
+            workload.set_index("HDV")["Số tour được giao"],
+            use_container_width=True
+        )
+
+        st.download_button(
+            "⬇️ Tải báo cáo HDV CSV",
+            workload.to_csv(index=False).encode("utf-8-sig"),
+            f"bao_cao_hdv_{report_month.strftime('%Y_%m')}.csv",
+            "text/csv",
+            use_container_width=True,
+        )
+    else:
+        st.info("Chưa có dữ liệu HDV để phân tích.")
+
+# ============================================================
+# HDV: TOUR ĐƯỢC GIAO
+# ============================================================
+elif menu == "🚌 Tour được giao":
+    st.markdown('<div class="section-title">🚌 Tour được giao cho tôi</div>',unsafe_allow_html=True)
+    assigned=query_df("""
+        SELECT t.tour_code AS `Mã tour`,t.tour_name AS `Tên tour`,DATE_FORMAT(t.travel_date,'%d/%m/%Y') AS `Ngày đi`,TIME_FORMAT(t.meeting_time,'%H:%i') AS `Giờ tập trung`,t.pickup_point AS `Điểm đón`,t.destination AS `Điểm đến`,t.guest_count AS `Số khách`,t.guest_language AS `Ngoại ngữ`,t.status AS `Trạng thái`,t.note AS `Ghi chú`
+        FROM tours t WHERE t.guide_code=:guide_code ORDER BY t.travel_date,t.meeting_time
+    """,{"guide_code":current_user["guide_code"]})
+    st.dataframe(assigned,use_container_width=True,hide_index=True)
+
+# ============================================================
+# HDV: LỊCH CÁ NHÂN
+# ============================================================
+elif menu == "📅 Lịch cá nhân":
+    st.markdown('<div class="section-title">📅 Lịch cá nhân</div>',unsafe_allow_html=True)
+    personal=query_df("SELECT DATE_FORMAT(travel_date,'%d/%m/%Y') AS `Ngày`,TIME_FORMAT(meeting_time,'%H:%i') AS `Giờ`,tour_name AS `Tour`,destination AS `Điểm đến`,guest_count AS `Số khách`,status AS `Trạng thái` FROM tours WHERE guide_code=:guide_code ORDER BY travel_date,meeting_time",{"guide_code":current_user["guide_code"]})
+    st.dataframe(personal,use_container_width=True,hide_index=True)
+
+# ============================================================
+# HDV: CẬP NHẬT TRẠNG THÁI
+# ============================================================
+elif menu == "🔄 Cập nhật trạng thái":
+    st.markdown('<div class="section-title">🔄 Cập nhật trạng thái tour</div>',unsafe_allow_html=True)
+    my_tours=query_df("SELECT tour_code AS `Mã tour`,tour_name AS `Tên tour`,status AS `Trạng thái` FROM tours WHERE guide_code=:guide_code AND status NOT IN ('Hoàn thành','Đã hủy') ORDER BY travel_date",{"guide_code":current_user["guide_code"]})
+    if my_tours.empty: st.info("Bạn hiện không có tour cần cập nhật.")
+    else:
+        code=st.selectbox("Chọn tour",my_tours["Mã tour"].tolist())
+        status=st.selectbox("Trạng thái mới",["Đã phân công","Đang thực hiện","Hoàn thành"])
+        note=st.text_input("Ghi chú")
+        if st.button("💾 CẬP NHẬT",type="primary",use_container_width=True):
+            try:
+                with get_engine().begin() as conn:
+                    conn.execute(text("UPDATE tours SET status=:status,note=:note WHERE tour_code=:code AND guide_code=:guide_code"),{"status":status,"note":note.strip(),"code":code,"guide_code":current_user["guide_code"]})
+                    conn.execute(text("UPDATE assignments SET status=:status WHERE tour_code=:code AND guide_code=:guide_code"),{"status":status,"code":code,"guide_code":current_user["guide_code"]})
+                    conn.execute(text("INSERT INTO logs(action,tour_code,content,created_by) VALUES ('HDV cập nhật trạng thái',:code,:content,:created_by)"),{"code":code,"content":f"HDV cập nhật → {status}. {note.strip()}","created_by":current_user["full_name"]})
+                    if status=="Hoàn thành": conn.execute(text("UPDATE guides SET status='Sẵn sàng' WHERE guide_code=:guide_code"),{"guide_code":current_user["guide_code"]})
+                st.success("Đã cập nhật trạng thái tour."); st.rerun()
+            except SQLAlchemyError as e: st.error("Không thể cập nhật trạng thái."); st.code(str(e))
+
+# ============================================================
+# TẠO TOUR - ĐIỀU HÀNH
+# ============================================================
+elif menu == "🚌 Tạo tour":
+    st.markdown('<div class="section-title">🚌 Tạo tour mới</div>',unsafe_allow_html=True)
+    with st.form("new_tour_role"):
+        c1,c2=st.columns(2); tour_name=c1.text_input("Tên tour *"); destination=c2.text_input("Điểm đến *")
+        c3,c4,c5=st.columns(3); travel_date=c3.date_input("Ngày đi",value=date.today()); meeting_time=c4.time_input("Giờ tập trung",value=time(7,0)); guests=c5.number_input("Số khách",min_value=1,max_value=10000,value=20)
+        c6,c7,c8=st.columns(3); pickup=c6.text_input("Điểm đón","TP.HCM"); language=c7.selectbox("Ngoại ngữ khách",["Tiếng Việt","Tiếng Anh","Tiếng Hàn","Tiếng Trung","Khác"]); tour_type=c8.selectbox("Loại tour",["Đoàn","Khách lẻ","MICE","VIP","Inbound"])
+        note=st.text_area("Ghi chú")
+        submit=st.form_submit_button("➕ TẠO TOUR",type="primary",use_container_width=True)
+        if submit:
+            if not tour_name.strip() or not destination.strip(): st.error("Vui lòng nhập Tên tour và Điểm đến.")
+            else:
+                code=make_id("TOUR")
+                try:
+                    with get_engine().begin() as conn:
+                        conn.execute(text("INSERT INTO tours(tour_code,tour_name,travel_date,meeting_time,pickup_point,destination,guest_count,guest_language,tour_type,guide_code,status,note) VALUES(:code,:name,:travel_date,:meeting_time,:pickup,:destination,:guests,:language,:tour_type,'','Chờ phân công',:note)"),{"code":code,"name":tour_name.strip(),"travel_date":travel_date,"meeting_time":meeting_time,"pickup":pickup.strip(),"destination":destination.strip(),"guests":guests,"language":language,"tour_type":tour_type,"note":note.strip()})
+                        conn.execute(text("INSERT INTO logs(action,tour_code,content,created_by) VALUES ('Tạo tour',:code,:content,:created_by)"),{"code":code,"content":f"Tạo tour {tour_name.strip()}","created_by":current_user["full_name"]})
+                    st.success(f"Đã tạo tour {code}."); st.rerun()
+                except SQLAlchemyError as e: st.error("Không thể tạo tour."); st.code(str(e))
 
 # ============================================================
 # TỔNG QUAN
