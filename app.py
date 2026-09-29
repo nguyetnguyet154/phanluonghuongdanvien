@@ -1794,7 +1794,7 @@ elif menu == "🤖 Chatbot AI":
                 try:
                     with st.spinner("AI đang trả lời..."):
                         response = client.models.generate_content(
-                            model="gemini-3.8-flash",
+                            model="gemini-3.1-flash-lite",
                             contents=conversation,
                             config=types.GenerateContentConfig(
                                 system_instruction=(
