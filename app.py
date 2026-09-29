@@ -7,6 +7,8 @@ from urllib.parse import quote_plus
 import uuid
 import hashlib
 import secrets
+from google import genai
+from google.genai import types
 
 # ============================================================
 # GUIDE FLOW - MYSQL / AIVEN VERSION
@@ -454,6 +456,8 @@ with st.sidebar:
             "📊 Tổng quan", "🚌 Tour được giao", "📅 Lịch cá nhân",
             "🔄 Cập nhật trạng thái"
         ]
+
+    menu_items.append("🤖 Chatbot AI")
 
     menu = st.radio("MENU", menu_items)
     st.divider()
@@ -1709,6 +1713,123 @@ elif menu == "📋 Lịch sử điều hành":
         "text/csv",
         use_container_width=True,
     )
+
+# ============================================================
+# CHATBOT AI - GEMINI
+# ============================================================
+elif menu == "🤖 Chatbot AI":
+    st.markdown(
+        '<div class="section-title">🤖 Chatbot AI hỗ trợ điều hành & du lịch</div>',
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "Trợ lý AI có thể hỗ trợ hỏi đáp về tour, hướng dẫn viên, "
+        "lịch trình và thông tin du lịch Vũng Tàu."
+    )
+
+    if "GEMINI_API_KEY" not in st.secrets:
+        st.error("Chưa tìm thấy GEMINI_API_KEY trong Streamlit Secrets.")
+        st.info(
+            'Vào Manage app → Settings → Secrets và thêm: '
+            'GEMINI_API_KEY = "key-của-bạn"'
+        )
+    else:
+        client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
+
+        if "gemini_chat_history" not in st.session_state:
+            st.session_state.gemini_chat_history = [
+                {
+                    "role": "assistant",
+                    "content": (
+                        "Xin chào 👋 Tôi là trợ lý AI của GuideFlow. "
+                        "Bạn có thể hỏi tôi về tour, hướng dẫn viên, lịch trình "
+                        "hoặc du lịch Vũng Tàu."
+                    ),
+                }
+            ]
+
+        top_left, _ = st.columns([1, 5])
+        with top_left:
+            if st.button("🗑️ Xóa hội thoại", key="clear_gemini_chat"):
+                st.session_state.gemini_chat_history = [
+                    {
+                        "role": "assistant",
+                        "content": (
+                            "Xin chào 👋 Tôi là trợ lý AI của GuideFlow. "
+                            "Bạn có thể hỏi tôi về tour, hướng dẫn viên, lịch trình "
+                            "hoặc du lịch Vũng Tàu."
+                        ),
+                    }
+                ]
+                st.rerun()
+
+        for msg in st.session_state.gemini_chat_history:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
+
+        user_prompt = st.chat_input(
+            "Ví dụ: Gợi ý lịch trình Vũng Tàu 2 ngày 1 đêm?"
+        )
+
+        if user_prompt:
+            st.session_state.gemini_chat_history.append(
+                {"role": "user", "content": user_prompt}
+            )
+
+            with st.chat_message("user"):
+                st.markdown(user_prompt)
+
+            # Giữ một phần lịch sử gần nhất để AI hiểu ngữ cảnh
+            recent = st.session_state.gemini_chat_history[-10:]
+            conversation = "\n".join(
+                (
+                    f"Người dùng: {m['content']}"
+                    if m["role"] == "user"
+                    else f"Trợ lý: {m['content']}"
+                )
+                for m in recent
+            )
+
+            with st.chat_message("assistant"):
+                try:
+                    with st.spinner("AI đang trả lời..."):
+                        response = client.models.generate_content(
+                            model="gemini-3.8-flash",
+                            contents=conversation,
+                            config=types.GenerateContentConfig(
+                                system_instruction=(
+                                    "Bạn là trợ lý AI cho hệ thống GuideFlow, "
+                                    "một ứng dụng quản lý tour và hướng dẫn viên. "
+                                    "Hãy trả lời bằng tiếng Việt, rõ ràng, thực tế. "
+                                    "Bạn có thể hỗ trợ về tour, hướng dẫn viên, "
+                                    "lịch trình, điều phối và du lịch Vũng Tàu. "
+                                    "Không bịa thông tin. Nếu thông tin như giá, "
+                                    "giờ mở cửa hoặc địa chỉ có thể thay đổi và "
+                                    "bạn không chắc chắn, hãy nhắc người dùng kiểm tra lại."
+                                ),
+                                temperature=0.7,
+                            ),
+                        )
+
+                        answer = (response.text or "").strip()
+                        if not answer:
+                            answer = (
+                                "Mình chưa tạo được câu trả lời. "
+                                "Bạn thử hỏi lại theo cách khác nhé."
+                            )
+
+                        st.markdown(answer)
+                        st.session_state.gemini_chat_history.append(
+                            {"role": "assistant", "content": answer}
+                        )
+
+                except Exception as e:
+                    error_text = str(e)
+                    st.error("Không gọi được Gemini API.")
+                    if "API_KEY" in error_text.upper() or "API key" in error_text:
+                        st.info("Hãy kiểm tra lại GEMINI_API_KEY trong Streamlit Secrets.")
+                    st.code(error_text)
+
 
 # ============================================================
 # FOOTER
